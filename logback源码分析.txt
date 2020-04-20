@@ -1,0 +1,524 @@
+
+util类：D:\maven_repository\ch\qos\logback\logback-core\1.2.3\logback-core-1.2.3.jar!\ch\qos\logback\core\util
+
+
+==================================  【logback 启动的过程】  ==================================
+
+public static final Logger LOGGER = LoggerFactory.getLogger(MyApp1.class);
+	org.slf4j.LoggerFactory#getLogger(java.lang.Class<?>)
+		Logger logger = getLogger(clazz.getName())
+			//查找当前的classpath下有没有org/slf4j/impl/StaticLoggerBinder.class类，这个类是slf4j和具体日志类的交接处，使用"ClassLoader.getSystemResources()"即可
+			org.slf4j.LoggerFactory#findPossibleStaticLoggerBinderPathSet()
+			
+			如果发现有多个org/slf4j/impl/StaticLoggerBinder.class类，就System.err.println(Slf4j:Class path contains multiple SLF4J bindings,Found binding in path + "])
+			
+			//检测StaticLoggerBinder类和它的getSingleton方法是否存在，如果不存在，分别会抛出 NoClassDefFoundError错误和NoSuchMethodError错误
+      // 注意，当存在多个StaticLoggerBinder时，应用不会停止，由JVM随机选择一个			
+			StaticLoggerBinder.getSingleton()
+				...
+					org.slf4j.impl.StaticLoggerBinder#init
+						ContextInitializer#autoConfig
+							1、检查有没有设置logback.configurationFile 系统参数，如果设置了则直接使用该值作为logback的日志文件
+							2、依次查找 logback-test.xml, logback.groovy, logback.xml
+							ContextInitializer#configureByResource(URL url)
+								GenericConfigurator#doConfigure(java.util.List<SaxEvent)
+									解析过程省略，感觉比较复制，
+									解析完之后会放入map缓存起来，如果配置了<configuration scan="true" scanPeriod="30 seconds" >，则会重新读取logback文件
+									如果这次读取失败了就还是使用之前的logback文件，也就是之前缓存起来的map
+
+									
+
+==================================  【logback 打日志的过程】  ==================================									
+									
+LOGGER.error("error happen")
+	ch.qos.logback.classic.Logger#buildLoggingEventAndAppend(...)
+		
+		// 包装成 LoggingEvent对象，向后传递并处理
+		LoggingEvent le = new LoggingEvent(localFQCN, this, level, msg, t, params)
+	
+		// 调用这个logger的所有appends, 如果配置了additivity=true, 则直接 break
+		ch.qos.logback.classic.Logger#callAppenders(ILoggingEvent event)
+		【该方法的处理过程】
+			这条日志打印先找logback.xml中有没有配置append，如果配置了就调用 appendList.appendLoopOnAppenders(event)
+			本logger的append处理完了之后，如果 additivity = false，就直接break，也就是不处理了直接返回
+			如果 additivity = true, 就找到本logger的parent logger再次进行判断有没有append，然后进行处理，该过程的终止条件有两个：
+			（1）找到了root logger 并处理完了，再往上层找 logger就是null了，也就结束了
+			（2）某一个层级的 logger 的 additivity = false，就立刻终止
+		
+			ch.qos.logback.core.UnsynchronizedAppenderBase#doAppend
+				ch.qos.logback.core.OutputStreamAppender#subAppend
+					// 调用该append的encoder进行序列化成byte数组，然后写入根据 immediateFlush 的值决定要不要立刻flush
+					byte[] byteArray = this.encoder.encode(event);
+						
+						ch.qos.logback.classic.PatternLayout#doLayout
+						writeBytes(byteArray);
+					
+		
+
+================================== 【异步写日志的过程和底层原理】 ==================================
+
+ch.qos.logback.core.UnsynchronizedAppenderBase#append
+	ch.qos.logback.core.AsyncAppenderBase#append
+		// 将loggingEvent对象放到 BlockingQueue<E> blockingQueue 就算处理完了, 根据 neverBlock 为 true 还是 false, 选择不同的存放方法
+		ch.qos.logback.core.AsyncAppenderBase#put(loggingEvent)
+			private void put(E eventObject) {
+        if (neverBlock) {
+            blockingQueue.offer(eventObject); //这个方法会返回特殊值，不会阻塞
+        } else {
+            boolean interrupted = false;
+						try {
+								while (true) {
+										try {
+												blockingQueue.put(eventObject); //这个方法会一直阻塞，直到成功放入一个值
+												break;
+										} catch (InterruptedException e) {
+												interrupted = true;
+										}
+								}
+						} finally {
+								if (interrupted) {
+										Thread.currentThread().interrupt();
+								}
+						}
+				}		
+    }
+		
+		另一个线程进行处理，while(true)一直循环
+		ch.qos.logback.core.AsyncAppenderBase.Worker#run()
+			E e = parent.blockingQueue.take(); //这个方法会一直阻塞，直到成功取到一个值
+      aai.appendLoopOnAppenders(e);
+		
+
+
+
+==================================  【Logback scan 的使用和底层原理】 ==================================
+
+Logback 可以在运行时动态加载配置文件，默认是一分钟加载一次（配置文件有修改才会进行加载）。用户可以更具实际情况自己修改加载的时间。
+
+<configuration scan="true" scanPeriod="30 seconds" > 
+  ...
+</configuration>
+scan=”true” 启用运行时加载功能，scanPeriod=”30 seconds” 设置定时加载周期。
+
+Logback scan 原理解析
+如果启用 scan 功能，Logback 会创建一个 ReconfigureOnChangeTask，在单独的线程中执行。
+
+参考 https://logback.qos.ch/manual/configuration.html
+
+ReconfigureOnChangeTask 源码分析
+ReconfigureOnChangeTask 本身是一个Runable接口， 定时执行 run 方法。
+
+@Override
+    public void run() {
+        fireEnteredRunMethod();
+        ConfigurationWatchList configurationWatchList = ConfigurationWatchListUtil.getConfigurationWatchList(context);
+        if (configurationWatchList == null) {
+            addWarn("Empty ConfigurationWatchList in context");
+            return;
+        }
+
+        List<File> filesToWatch = configurationWatchList.getCopyOfFileWatchList();
+        if (filesToWatch == null || filesToWatch.isEmpty()) {
+            addInfo("Empty watch file list. Disabling ");
+            return;
+        }
+		// 检查配置文件是否发生变化，如果变化进行配置更新
+        if (!configurationWatchList.changeDetected()) {
+            return;
+        }
+		// 触发配置变更事件
+        fireChangeDetected();
+        URL mainConfigurationURL = configurationWatchList.getMainURL();
+
+        addInfo(DETECTED_CHANGE_IN_CONFIGURATION_FILES);
+        addInfo(CoreConstants.RESET_MSG_PREFIX + "named [" + context.getName() + "]");
+
+        LoggerContext lc = (LoggerContext) context;
+        if (mainConfigurationURL.toString().endsWith("xml")) {
+			// 重新进行配置
+            performXMLConfiguration(lc, mainConfigurationURL);
+        } else if (mainConfigurationURL.toString().endsWith("groovy")) {
+            if (EnvUtil.isGroovyAvailable()) {
+                lc.reset();
+                // avoid directly referring to GafferConfigurator so as to avoid
+                // loading groovy.lang.GroovyObject . See also http://jira.qos.ch/browse/LBCLASSIC-214
+                // GafferUtil.runGafferConfiguratorOn(lc, this, mainConfigurationURL);
+                addError("Groovy configuration disabled due to Java 9 compilation issues.");
+                
+            } else {
+                addError("Groovy classes are not available on the class path. ABORTING INITIALIZATION.");
+            }
+        }
+		// 触发 重新配置完成 事件
+        fireDoneReconfiguring();
+    }
+private void performXMLConfiguration(LoggerContext lc, URL mainConfigurationURL) {
+        JoranConfigurator jc = new JoranConfigurator();
+        jc.setContext(context);
+        StatusUtil statusUtil = new StatusUtil(context);
+        List<SaxEvent> eventList = jc.recallSafeConfiguration();
+
+        URL mainURL = ConfigurationWatchListUtil.getMainWatchURL(context);
+        lc.reset();
+        long threshold = System.currentTimeMillis();
+        try {
+            jc.doConfigure(mainConfigurationURL);
+            if (statusUtil.hasXMLParsingErrors(threshold)) {
+				// 如果配置失败回滚到上次配置
+                fallbackConfiguration(lc, eventList, mainURL);
+            }
+        } catch (JoranException e) {
+            fallbackConfiguration(lc, eventList, mainURL);
+        }
+    }
+ReconfigureOnChangeTask 依赖 ConfigurationWatchListUtil 判断配置文件是否发生变化， ConfigurationWatchList 执行文件监控
+
+ConfigurationWatchList 源码分析
+// 添加监控的文件，保存文件最后的修改时间
+private void addAsFileToWatch(URL url) {
+        File file = convertToFile(url);
+        if (file != null) {
+            fileWatchList.add(file);
+            lastModifiedList.add(file.lastModified());
+        }
+    }
+// 判断 文件是否变化，依据当前的文件的最后修改时间和上次保存的最后修改时间。
+public boolean changeDetected() {
+        int len = fileWatchList.size();
+        for (int i = 0; i < len; i++) {
+            long lastModified = lastModifiedList.get(i);
+            File file = fileWatchList.get(i);
+            if (lastModified != file.lastModified()) {
+                return true;
+            }
+        }
+        return false;
+        // return (lastModified != fileToScan.lastModified() && lastModified != SENTINEL);
+    }
+	
+					
+
+==================================  【maxFileSize、 maxHistory、 totalSizeCap 参数的处理过程】================================== 
+
+好像只有<appender name="ROLLING" class="ch.qos.logback.core.rolling.RollingFileAppender">才能配置这个参数，不是很确定，确认下
+					
+LOGGER.error("error happen")
+	ch.qos.logback.classic.Logger#error(java.lang.String)
+		ch.qos.logback.classic.Logger#buildLoggingEventAndAppend
+			ch.qos.logback.core.spi.AppenderAttachableImpl#appendLoopOnAppenders
+				ch.qos.logback.core.OutputStreamAppender#append
+					ch.qos.logback.core.rolling.RollingFileAppender#subAppend   // RollingFileAppender.java 的 231行打断点
+						ch.qos.logback.core.rolling.RollingFileAppender#attemptRollover
+							ch.qos.logback.core.rolling.TimeBasedRollingPolicy#rollover
+								ch.qos.logback.core.rolling.helper.TimeBasedArchiveRemover#cleanAsynchronously
+									ch.qos.logback.core.rolling.helper.TimeBasedArchiveRemover.ArhiveRemoverRunnable#run
+					
+						super.subAppend(event)
+							ch.qos.logback.core.OutputStreamAppender#subAppend
+								byte[] byteArray = this.encoder.encode(event);  //编码
+								writeBytes(byteArray) //写入数据
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
